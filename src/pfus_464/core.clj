@@ -19,22 +19,60 @@
       WHERE pql.PROJNUM IS NULL
         AND orphan.id IS NULL")
 
+(def wrong-cqn-query
+     "SELECT q2p.projnum, q2p.projvers, q2p.cqn_id, q2p.qn_id, cqn.qn_id
+      FROM qn2proj q2p, completedqn cqn
+      WHERE q2p.CQN_ID = cqn.ID and cqn.QN_ID <> q2p.qn_id")
+
+(def drop-wrong-cqn-table-query
+     "DROP TABLE wrong_questionnaire4")
+
+(def create-wrong-cqn-table-query
+     "CREATE GLOBAL TEMPORARY TABLE wrong_questionnaire4
+      ON COMMIT PRESERVE ROWS
+      AS SELECT cqn.*
+         FROM completedqn cqn
+           JOIN qn2proj pql on pql.cqn_id = cqn.id
+         WHERE cqn.qn_id <> pql.qn_id")
+
 (def drop-orphan-table-query
-     "DROP TABLE orphan_cqn")
+     "DROP TABLE orphan_cqn4")
 
 (def create-orphan-table-query
-     "CREATE GLOBAL TEMPORARY TABLE orphan_cqn
+     "CREATE GLOBAL TEMPORARY TABLE orphan_cqn4
       ON COMMIT PRESERVE ROWS
       AS SELECT cqn.*
          FROM completedqn cqn
          LEFT OUTER JOIN qn2proj pql ON pql.cqn_id = cqn.id
          WHERE pql.PROJNUM IS NULL")
 
+(defn table-exists? [table]
+  "Verify if a table exists"
+  (= "1"
+     (sql/do-commands
+      (str "select count(*)
+              from all_tables
+              where table_name='" table "'"))))
+
+(defn execute-if-exists [table & commands]
+  (when (table-exists? table)
+    (sql/do-commands commands)))
+
 (defn create-orphan-table []
   "Create the table with the current orphaned CQN's. We use a temporary table
    which must be dropped before creating the snapshot"
-  (sql/do-commands drop-orphan-table-query
-                   create-orphan-table-query))
+  (do
+    (log/info "Creating orphan tables")
+    (map (fn [table command] (apply 'execute-if-exists table command))
+         '("wrong_questionnaire" "orphan_cqn")
+         '(drop-wrong-cqn-table-query drop-orphan-table-query))
+    (sql/do-commands create-orphan-table-query
+                     create-wrong-cqn-table-query)))
+
+(defn create-wrong-cqn-table []
+  "Create the table with the wrong CQN's."
+  (sql/do-commands drop-wrong-cqn-table-query
+                   create-wrong-cqn-table-query))
 
 (defn cqn-to-str [cqn]
   "Make a human readable string representing a CQN"
@@ -43,31 +81,30 @@
        "/" (:version cqn)
        " " (:name cqn)))
 
-(defn new-orphans [map]
+(defn new-orphans [map query message]
   "checks the database for orphans since the start of the program.
   If a CQN orphan is found which is not already in the passed map
   log an info message and add it to the orphans map.
 
   Return the updated map"
   (let [orphans (atom map)]
-    (sql/with-query-results result [new-orphan-cqn-query]
+    (sql/with-query-results result [query]
       (doseq [record result]
         (let [orphan-str (cqn-to-str record)
               id         (:id record)]
           (if (not (contains? @orphans id))
-            (log/info (str "New orphan detected : " orphan-str)))
+            (log/info (str query orphan-str)))
           (reset! orphans (assoc @orphans id record)))))
-    @orphans
-    ))
+    @orphans))
 
 (def active (atom nil))
 
-(defn monitor-orphans [orphans]
-  "Check every second if a new orphan was created"
-  (let [n (new-orphans orphans)]
+(defn monitor-new-errors [new-errors-fn errors]
+  "Check every second if a new error was created"
+  (let [n (new-errors-fn errors)]
     (Thread/sleep 1000)
-    (if active (recur n))))
-
+    (if active
+      (recur new-errors-fn n))))
 
 (defn monitor []
   "Create the database connection, create a snapshot temporary table for the
@@ -76,7 +113,7 @@
     (do
       (log/info "Orphan CQN Monitor started")
       (create-orphan-table)
-      (try (monitor-orphans {})
+      (try (monitor-new-errors #(new-orphans %1 new-orphan-cqn-query "New orphan detected : ") {})
            (catch InterruptedException e  (log/info "Monitor interrupted")))
       (log/info "Orphan CQN monitor stopped"))))
 
@@ -94,8 +131,7 @@
 (defn -main []
   (println "Orphan Completed Questionnaire Monitor")
   (log/info "Testing the logger")
-  (start)
-)
+  (start))
 
 
 
